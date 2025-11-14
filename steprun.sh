@@ -20,8 +20,50 @@ if [ -z "$WANDB_RUN" ]; then
     WANDB_RUN=dummy
 fi
 
-# GPU数量
-NPROC_PER_NODE=8
+# 检测系统和硬件
+ detect_system_and_hardware() {
+    # 检测操作系统
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS系统
+        echo "检测到macOS系统"
+        
+        # 检测Apple Silicon
+        if [[ $(uname -m) == "arm64" ]]; then
+            echo "检测到Apple Silicon (M1/M2/M3)"
+            DEVICE_TYPE="mps"
+            NPROC_PER_NODE=1  # Apple Silicon目前不支持多GPU分布式训练
+        else
+            echo "检测到Intel Mac"
+            DEVICE_TYPE="cpu"
+            NPROC_PER_NODE=1  # Intel Mac使用CPU
+        fi
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        # Linux系统
+        echo "检测到Linux系统"
+        
+        # 检测NVIDIA GPU
+        if command -v nvidia-smi &> /dev/null; then
+            GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+            echo "检测到 $GPU_COUNT 个NVIDIA GPU"
+            DEVICE_TYPE="cuda"
+            NPROC_PER_NODE=$GPU_COUNT
+        else
+            echo "未检测到NVIDIA GPU，使用CPU"
+            DEVICE_TYPE="cpu"
+            NPROC_PER_NODE=1
+        fi
+    else
+        # 其他系统，默认使用CPU
+        echo "检测到未知系统，默认使用CPU"
+        DEVICE_TYPE="cpu"
+        NPROC_PER_NODE=1
+    fi
+    
+    echo "设备类型: $DEVICE_TYPE, 进程数: $NPROC_PER_NODE"
+}
+
+# 精度设置
+export NANOCHAT_PRECISION="bf16"
 
 # 数据集下载进程ID
 DATASET_DOWNLOAD_PID=""
@@ -51,6 +93,19 @@ mark_dataset_downloaded() {
 # 设置步骤
 setup() {
     echo "===== 开始设置环境 ====="
+
+    # 检查并安装 Rust/Cargo
+    echo "检查并安装 Rust..."
+    if ! command -v rustc &> /dev/null || ! command -v cargo &> /dev/null; then
+        echo "Rust 未安装，开始安装..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source "$HOME/.cargo/env"
+    else
+        echo "Rust 已安装，跳过安装"
+        # 确保环境变量已加载
+        source "$HOME/.cargo/env"
+    fi
+
     # install uv (if not already installed)
     echo "检查并安装 uv..."
     if ! command -v uv &> /dev/null; then
@@ -66,22 +121,21 @@ setup() {
     
     # install the repo dependencies
     echo "安装项目依赖..."
-    uv sync --extra gpu
+    
+    # 检测系统和硬件
+    detect_system_and_hardware
+    
+    # 根据系统选择合适的依赖
+    if [[ "$DEVICE_TYPE" == "cuda" ]]; then
+        echo "安装GPU版本依赖..."
+        uv sync --extra gpu
+    else
+        echo "安装CPU版本依赖（包含Apple Silicon MPS支持）..."
+        uv sync --extra cpu
+    fi
     
     # activate venv
     source .venv/bin/activate
-    
-    # 检查并安装 Rust/Cargo
-    echo "检查并安装 Rust..."
-    if ! command -v rustc &> /dev/null || ! command -v cargo &> /dev/null; then
-        echo "Rust 未安装，开始安装..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        source "$HOME/.cargo/env"
-    else
-        echo "Rust 已安装，跳过安装"
-        # 确保环境变量已加载
-        source "$HOME/.cargo/env"
-    fi
     
     echo "===== 环境设置完成 ====="
 }
@@ -190,10 +244,21 @@ base_model() {
     fi
     
     # 预训练模型
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+    if [[ "$DEVICE_TYPE" == "cuda" ]]; then
+        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+    else
+        # Mac系统使用单进程
+        python -m scripts.base_train -- --depth=20 --run=$WANDB_RUN --device_type=$DEVICE_TYPE
+    fi
     # 评估模型
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+    if [[ "$DEVICE_TYPE" == "cuda" ]]; then
+        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
+        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+    else
+        # Mac系统使用单进程
+        python -m scripts.base_loss -- --device_type=$DEVICE_TYPE
+        python -m scripts.base_eval -- --device_type=$DEVICE_TYPE
+    fi
     echo "===== 基础模型训练完成 ====="
 }
 
@@ -222,8 +287,14 @@ mid_training() {
     curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
     
     # 运行中间训练和评估
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
+    if [[ "$DEVICE_TYPE" == "cuda" ]]; then
+        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN
+        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
+    else
+        # Mac系统使用单进程
+        python -m scripts.mid_train -- --run=$WANDB_RUN --device_type=$DEVICE_TYPE
+        python -m scripts.chat_eval -- -i mid --device_type=$DEVICE_TYPE
+    fi
     echo "===== 中间训练完成 ====="
 }
 
@@ -249,8 +320,14 @@ sft() {
     fi
     
     # 训练和评估
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
+    if [[ "$DEVICE_TYPE" == "cuda" ]]; then
+        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
+        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
+    else
+        # Mac系统使用单进程
+        python -m scripts.chat_sft -- --run=$WANDB_RUN --device_type=$DEVICE_TYPE
+        python -m scripts.chat_eval -- -i sft --device_type=$DEVICE_TYPE
+    fi
     echo "===== 监督微调完成 ====="
     echo "您现在可以使用以下命令与模型交互:"
     echo "  python -m scripts.chat_cli -p \"Why is the sky blue?\""
@@ -279,9 +356,14 @@ rl() {
     fi
     
     # 运行强化学习
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_rl -- --run=$WANDB_RUN
-    # 评估RL模型
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i rl -a GSM8K
+    if [[ "$DEVICE_TYPE" == "cuda" ]]; then
+        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_rl -- --run=$WANDB_RUN
+        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i rl -a GSM8K
+    else
+        # Mac系统使用单进程
+        python -m scripts.chat_rl -- --run=$WANDB_RUN --device_type=$DEVICE_TYPE
+        python -m scripts.chat_eval -- -i rl -a GSM8K --device_type=$DEVICE_TYPE
+    fi
     echo "===== 强化学习完成 ====="
 }
 
@@ -309,6 +391,10 @@ report() {
 # 显示帮助信息
 show_help() {
     echo "用法: bash step_run.sh [step1] [step2] ..."
+    echo ""
+    echo "系统检测信息:"
+    detect_system_and_hardware
+    echo ""
     echo "可用步骤:"
     echo "  setup         - 设置Python和Rust环境"
     echo "  download_dataset [--shards=N] - 下载数据集，默认下载240个分片"
@@ -319,8 +405,15 @@ show_help() {
     echo "  rl            - 强化学习（可选，要求240个分片已下载）"
     echo "  report        - 生成完整报告"
     echo "  all           - 执行所有步骤（会并行下载240分片和训练分词器）"
+    echo ""
+    echo "Mac系统支持:"
+    echo "  - Apple Silicon (M1/M2/M3): 自动使用MPS加速"
+    echo "  - Intel Mac: 使用CPU模式"
+    echo "  - 不支持多GPU分布式训练，使用单进程模式"
+    echo ""
     echo "参数说明:"
     echo "  --shards=N    - 指定下载的数据集分片数量（仅适用于download_dataset步骤）"
+    echo ""
     echo "示例:"
     echo "  bash step_run.sh setup download_dataset --shards=8"
     echo "  bash step_run.sh download_dataset"
@@ -362,8 +455,11 @@ run_all() {
     report
 }
 
-# 主函数
+# 执行主函数
 main() {
+    # 检测系统和硬件（全局变量）
+    detect_system_and_hardware
+    
     # 如果没有参数，显示帮助
     if [ $# -eq 0 ]; then
         show_help
