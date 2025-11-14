@@ -12,6 +12,7 @@ from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
+from nanochat.precision import get_autocast_dtype
 
 # Set up logging
 setup_default_logging()
@@ -65,12 +66,16 @@ def build_model(checkpoint_dir, step, device, phase):
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
+    
+    target_dtype = get_autocast_dtype(get_precision())
+    
     if device.type in {"cpu", "mps"}:
-        # Convert bfloat16 tensors to float for CPU inference
+        # Convert tensors to target precision for CPU/MPS inference
         model_data = {
-            k: v.float() if v.dtype == torch.bfloat16 else v
+            k: v.to(target_dtype) if v.dtype in [torch.bfloat16, torch.float16, torch.float32] else v
             for k, v in model_data.items()
         }
+    
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
@@ -82,6 +87,10 @@ def build_model(checkpoint_dir, step, device, phase):
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
     model.load_state_dict(model_data, strict=True, assign=True)
+    
+    # Convert model to target precision
+    model = model.to(target_dtype)
+    
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()

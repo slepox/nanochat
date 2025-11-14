@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
+from nanochat.precision import get_torch_dtype, convert_tensor_to_precision
 
 @dataclass
 class GPTConfig:
@@ -166,9 +167,10 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
+        # Cast the embeddings to configured precision: optim can tolerate it and it saves memory: both in the model and the activations
         if self.transformer.wte.weight.device.type == "cuda":
-            self.transformer.wte.to(dtype=torch.bfloat16)
+            target_dtype = get_torch_dtype()
+            self.transformer.wte.to(dtype=target_dtype)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -195,7 +197,9 @@ class GPT(nn.Module):
         # calculate the rotation frequencies at each (time, channel) pair
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
+        # Convert to configured precision instead of hardcoded bfloat16
+        target_dtype = get_torch_dtype()
+        cos, sin = cos.to(dtype=target_dtype), sin.to(dtype=target_dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
 
@@ -247,7 +251,8 @@ class GPT(nn.Module):
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
+        target_dtype = get_torch_dtype()
+        assert self.cos.dtype == target_dtype, f"Rotary embeddings must be in {target_dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length

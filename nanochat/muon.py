@@ -5,6 +5,7 @@ Also a lot of borrowing of ideas from modded-nanogpt.
 import torch
 from torch import Tensor
 import torch.distributed as dist
+from nanochat.precision import get_torch_dtype, convert_tensor_to_precision
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
@@ -19,7 +20,9 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
+    # Use configured precision instead of hardcoded bfloat16
+    target_dtype = get_torch_dtype()
+    X = G.to(dtype=target_dtype)
     if G.size(-2) > G.size(-1):
         X = X.mT
 
