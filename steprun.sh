@@ -11,9 +11,8 @@ export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
-# 持久化标记文件路径
-export DATASET_8_SHARDS_FLAG="$NANOCHAT_BASE_DIR/.dataset_8_shards_done"
-export DATASET_240_SHARDS_FLAG="$NANOCHAT_BASE_DIR/.dataset_240_shards_done"
+# 数据集存储目录
+export DATA_DIR="$NANOCHAT_BASE_DIR/base_data"
 
 # wandb设置
 if [ -z "$WANDB_RUN" ]; then
@@ -71,23 +70,42 @@ DATASET_DOWNLOAD_PID=""
 # 检查数据集是否已下载
 dataset_is_downloaded() {
     local shards=$1
-    if [ "$shards" -eq 8 ]; then
-        [ -f "$DATASET_8_SHARDS_FLAG" ]
-    elif [ "$shards" -eq 240 ]; then
-        [ -f "$DATASET_240_SHARDS_FLAG" ]
+
+    # 确保数据目录存在
+    if [ ! -d "$DATA_DIR" ]; then
+        return 1
+    fi
+
+    # 检查前N个分片文件是否都存在
+    # 文件名格式: shard_00000.parquet, shard_00001.parquet, ...
+    local missing=0
+    for ((i=0; i<shards; i++)); do
+        local filename=$(printf "shard_%05d.parquet" $i)
+        local filepath="$DATA_DIR/$filename"
+        if [ ! -f "$filepath" ]; then
+            missing=$((missing + 1))
+        fi
+    done
+
+    # 如果所有文件都存在，返回成功
+    if [ $missing -eq 0 ]; then
+        return 0
     else
+        echo "缺少 $missing 个分片文件（总共需要 $shards 个）"
         return 1
     fi
 }
 
-# 标记数据集下载完成
-mark_dataset_downloaded() {
-    local shards=$1
-    if [ "$shards" -eq 8 ]; then
-        touch "$DATASET_8_SHARDS_FLAG"
-    elif [ "$shards" -eq 240 ]; then
-        touch "$DATASET_240_SHARDS_FLAG"
+# 获取已下载的数据集分片数量
+get_downloaded_shards_count() {
+    if [ ! -d "$DATA_DIR" ]; then
+        echo 0
+        return
     fi
+
+    # 统计 shard_*.parquet 文件数量（排除临时文件）
+    local count=$(find "$DATA_DIR" -name "shard_*.parquet" ! -name "*.tmp" 2>/dev/null | wc -l | tr -d ' ')
+    echo $count
 }
 
 # 设置步骤
@@ -166,15 +184,19 @@ download_dataset() {
         esac
     done
     
+    # 检查已下载的分片数量
+    local current_count=$(get_downloaded_shards_count)
+    echo "当前已下载 $current_count 个数据分片"
+
     # 下载指定数量的数据分片
     if dataset_is_downloaded $shards; then
-        echo "$shards 个数据分片已存在，跳过下载"
+        echo "$shards 个数据分片已全部存在，跳过下载"
     else
         echo "下载 $shards 个数据分片..."
         python -m nanochat.dataset -n $shards
         if [ $? -eq 0 ]; then
-            mark_dataset_downloaded $shards
-            echo "$shards 个数据分片下载完成"
+            local new_count=$(get_downloaded_shards_count)
+            echo "$shards 个数据分片下载完成（当前共有 $new_count 个分片）"
         else
             echo "数据集下载失败"
             return 1
@@ -202,12 +224,15 @@ tokenizer() {
     python -m nanochat.report reset
     
     # 检查并下载初始数据集（如果需要）
+    local current_count=$(get_downloaded_shards_count)
+    echo "当前已下载 $current_count 个数据分片"
+
     if ! dataset_is_downloaded 8; then
-        echo "初始8个数据分片尚未下载，开始下载..."
+        echo "初始8个数据分片尚未完全下载，开始下载..."
         python -m nanochat.dataset -n 8
         if [ $? -eq 0 ]; then
-            mark_dataset_downloaded 8
-            echo "初始8个数据分片下载完成"
+            local new_count=$(get_downloaded_shards_count)
+            echo "初始8个数据分片下载完成（当前共有 $new_count 个分片）"
         else
             echo "初始数据集下载失败"
             return 1
