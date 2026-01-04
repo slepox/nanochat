@@ -5,3 +5,6 @@ dev-ignore/
 report.md
 eval_bundle/
 .vscode/
+
+# Secrets
+.env
