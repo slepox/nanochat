@@ -4,7 +4,10 @@ __pycache__/
 dev-ignore/
 report.md
 eval_bundle/
-.vscode/
 
 # Secrets
 .env
+
+# Local setup
+CLAUDE.md
+wandb/
